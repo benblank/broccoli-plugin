@@ -7,6 +7,9 @@ var mapSeries = require('promise-map-series')
 var rimraf = require('rimraf')
 var symlinkOrCopy = require('symlink-or-copy')
 var symlinkOrCopySync = symlinkOrCopy.sync
+const fstree = require('fs-tree-diff');
+const FSMergeTree = require('fs-tree-diff/lib/fs-merge-tree');
+const RSVP = require('rsvp');
 
 // Mimic how a Broccoli builder would call a plugin, using quickTemp to create
 // directories
@@ -36,7 +39,40 @@ function ReadCompat(plugin) {
     }
   }
 
+  if (plugin.description == null) {
+    plugin.description = this.pluginInterface.name
+    if (this.pluginInterface.annotation != null) {
+      plugin.description += ': ' + this.pluginInterface.annotation
+    }
+  }
+
+  this._hasSetup = false;
+}
+
+function inputNodeToInputTree(outputPaths, node, index) {
+  if (typeof node === 'string') {
+    return path.resolve(node);
+  }
+
+  return node.out || node.outputPath || outputPaths[index];
+}
+
+ReadCompat.prototype.setupFS = function (outputPaths) {
+  if (this._hasSetup) { return; }
+
+  this.inTree = new FSMergeTree({
+    inputs: this.pluginInterface.inputNodes.map(inputNodeToInputTree.bind(null, outputPaths))
+  });
+
+  if (this.pluginInterface.fsFacade) {
+    this.outTree = new fstree.WritableTree({ root: this.outputPath });
+  } else {
+    this.outTree = new fstree.SourceTree({ root: this.outputPath });
+  }
+
   this.pluginInterface.setup(null, {
+    inTree: this.inTree,
+    outTree: this.outTree,
     inputPaths: this.inputPaths,
     outputPath: this.outputPath,
     cachePath: this.cachePath
@@ -44,12 +80,7 @@ function ReadCompat(plugin) {
 
   this.callbackObject = this.pluginInterface.getCallbackObject()
 
-  if (plugin.description == null) {
-    plugin.description = this.pluginInterface.name
-    if (this.pluginInterface.annotation != null) {
-      plugin.description += ': ' + this.pluginInterface.annotation
-    }
-  }
+  this._hasSetup = true;
 }
 
 ReadCompat.prototype.read = function(readTree) {
@@ -62,35 +93,47 @@ ReadCompat.prototype.read = function(readTree) {
 
   return mapSeries(this.pluginInterface.inputNodes, readTree)
     .then(function(outputPaths) {
-      var priorBuildInputNodeOutputPaths = self._priorBuildInputNodeOutputPaths;
-      // In old .read-based Broccoli, the inputNodes's outputPaths can change
-      // on each rebuild. But the new API requires that our plugin sees fixed
-      // input paths. Therefore, we symlink the inputNodes' outputPaths to our
-      // (fixed) inputPaths on each .read.
-      for (var i = 0; i < outputPaths.length; i++) {
-        var priorPath = priorBuildInputNodeOutputPaths[i]
-        var currentPath = outputPaths[i]
+      self.setupFS(outputPaths);
 
-        // if this output path is different from last builds or
-        // if we cannot symlink then clear and symlink/copy manually
-        var hasDifferentPath = priorPath !== currentPath
-        var forceReSymlinking = !symlinkOrCopy.canSymlink || hasDifferentPath
+      // These symlinks aren't used by fsFacade plugins.
+      if (!self.pluginInterface.fsFacade) {
+        var priorBuildInputNodeOutputPaths = self._priorBuildInputNodeOutputPaths;
+        // In old .read-based Broccoli, the inputNodes's outputPaths can change
+        // on each rebuild. But the new API requires that our plugin sees fixed
+        // input paths. Therefore, we symlink the inputNodes' outputPaths to our
+        // (fixed) inputPaths on each .read.
+        for (var i = 0; i < outputPaths.length; i++) {
+          var priorPath = priorBuildInputNodeOutputPaths[i]
+          var currentPath = outputPaths[i]
 
-        if (forceReSymlinking) {
+          // if this output path is different from last builds or
+          // if we cannot symlink then clear and symlink/copy manually
+          var hasDifferentPath = priorPath !== currentPath
+          var forceReSymlinking = !symlinkOrCopy.canSymlink || hasDifferentPath
 
-          // avoid `rimraf.sync` for initial build
-          if (priorPath) {
-            rimraf.sync(self.inputPaths[i])
+          if (forceReSymlinking) {
+            // avoid `rimraf.sync` for initial build
+            if (priorPath) {
+              rimraf.sync(self.inputPaths[i])
+            }
+
+            symlinkOrCopySync(currentPath, self.inputPaths[i])
           }
-
-          symlinkOrCopySync(currentPath, self.inputPaths[i])
         }
+
+        // save for next builds comparison
+        self._priorBuildInputNodeOutputPaths = outputPaths;
       }
 
-      // save for next builds comparison
-      self._priorBuildInputNodeOutputPaths = outputPaths;
-
-      return self.callbackObject.build()
+      console.log(`======== Building ${self.pluginInterface.name + (self.pluginInterface.annotation != null ? ' (' + self.pluginInterface.annotation + ')' : '')}`);
+      if (self.outTree.start) {
+        self.outTree.start();
+      }
+      return RSVP.resolve(self.callbackObject.build()).finally(() => {
+        if (self.outTree.stop) {
+          self.outTree.stop();
+        }
+      });
     })
     .then(function() {
       return self.outputPath
