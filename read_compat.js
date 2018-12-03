@@ -125,7 +125,6 @@ ReadCompat.prototype.read = function(readTree) {
         self._priorBuildInputNodeOutputPaths = outputPaths;
       }
 
-      console.log(`======== Building ${self.pluginInterface.name + (self.pluginInterface.annotation != null ? ' (' + self.pluginInterface.annotation + ')' : '')}`);
       if (self.outTree.start) {
         self.outTree.start();
       }
